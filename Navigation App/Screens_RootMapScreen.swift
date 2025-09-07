@@ -13,6 +13,8 @@ struct RootMapScreen: View {
     @StateObject private var nav = NavigationState()
     @StateObject private var poi = QuickPOISearch()
     @StateObject private var store = RouteStore()
+    @StateObject private var place = PlaceSearch()
+    @StateObject private var location = LocationManager()
 
     // Mapカメラ / 表示リージョン
     @State private var camera: MapCameraPosition
@@ -30,6 +32,9 @@ struct RootMapScreen: View {
     // 検索ボックス
     @State private var searchText = ""
     @State private var showingRouteOption = false
+
+    // 現在地追従
+    @State private var followUser = true
 
     init() {
         let region = MKCoordinateRegion(
@@ -51,6 +56,10 @@ struct RootMapScreen: View {
                             Circle().frame(width: 4, height: 4).foregroundStyle(.blue)
                         }
                     }
+                }
+                // 目的地検索の結果
+                ForEach(place.results) { item in
+                    Marker(item.name, coordinate: item.coordinate)
                 }
                 // POIピン
                 ForEach(poi.results) { item in
@@ -85,7 +94,10 @@ struct RootMapScreen: View {
                         ForEach([QuickPOIKind.gas, .ev, .toilet, .conv]) { k in
                             Button {
                                 if poi.active == k { poi.clear() }
-                                else { poi.run(k, around: searchRegion.center) }
+                                else {
+                                    poi.run(k, around: searchRegion.center,
+                                            span: searchRegion.span)
+                                }
                             } label: {
                                 Label(k.rawValue, systemImage: k.icon)
                                     .padding(.vertical, 6).padding(.horizontal, 10)
@@ -107,7 +119,7 @@ struct RootMapScreen: View {
                     VStack(spacing: 10) {
                         ForEach([QuickPOIKind.gas, .ev, .toilet, .conv]) { k in
                             Button {
-                                poi.run(k, around: searchRegion.center)
+                                poi.run(k, around: searchRegion.center, span: searchRegion.span)
                                 if let nearest = poi.results.first {
                                     nav.nextSymbol = "mappin.and.ellipse"
                                     nav.nextDistanceM = MKMapPoint(nearest.coordinate)
@@ -131,8 +143,22 @@ struct RootMapScreen: View {
                 Spacer()
                 SearchBar(
                     text: $searchText,
-                    onSearch: { _ in /* TODO: 実検索 */ },
-                    onRoute: { _ in nav.isNavigating = true },   // モックでナビ開始
+                    onSearch: { text in
+                        place.search(query: text, in: searchRegion)
+                        // 見つかったらマップを寄せる
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                            if let first = place.results.first {
+                                camera = .camera(
+                                    MapCamera(centerCoordinate: first.coordinate,
+                                              distance: 1500, heading: 0, pitch: 0)
+                                )
+                            }
+                        }
+                    },
+                    onRoute: { text in
+                        place.search(query: text, in: searchRegion)
+                        nav.isNavigating = true
+                    },
                     onOption: { showingRouteOption = true }
                 )
                 .padding(.horizontal, 12)
@@ -179,6 +205,16 @@ struct RootMapScreen: View {
                 .ignoresSafeArea(edges: .bottom)
             }
         }
+        // 位置権限＆更新開始
+        .onAppear { location.start() }
+        // 現在地追従（任意でOFFにもできるようにhookだけ用意）
+        .onReceive(location.$lastCoordinate) { coord in
+            guard followUser, let c = coord else { return }
+            camera = .camera(
+                MapCamera(centerCoordinate: c,
+                          distance: 1200, heading: 0, pitch: 0)
+            )
+        }
         .sheet(isPresented: $showingSave) {
             SaveSheet(title: "ルートを保存", name: $saveName) {
                 let coords = pointsFromEdit(points: editPoints,
@@ -200,7 +236,7 @@ struct RootMapScreen: View {
             RouteOptionSheet(useHighway: $nav.useHighway)
         }
         .onAppear {
-            // デモ：ナビ中のレーン減少通知（擬似）
+            // デモ：ナビ中レーン減少通知（擬似）
             DispatchQueue.main.asyncAfter(deadline: .now()+3) {
                 if nav.isNavigating { nav.laneDropMessage = "1 km先で 3 → 2 車線" }
             }
