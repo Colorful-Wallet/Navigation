@@ -10,33 +10,34 @@ import MapKit
 import UIKit
 
 struct RootMapScreen: View {
-    // 既存状態
+    // 状態
     @StateObject private var nav = NavigationState()
     @StateObject private var poi = QuickPOISearch()
     @StateObject private var store = RouteStore()
     @StateObject private var place = PlaceSearch()
     @StateObject private var location = LocationManager()
 
-    // 追加：編集/ルート
+    // ルーティング
     @StateObject private var engine = RouteEngine()
     @StateObject private var editor = RouteEditor()
 
-    // Apple純正風サジェスト
+    // 検索補完
     @StateObject private var sugg = SearchCompleter()
 
     // Map
     @State private var camera: MapCameraPosition
     @State private var searchRegion: MKCoordinateRegion
 
-    // 編集モード
+    // 編集
     @State private var editMode: EditModeKind = .none
     @State private var draggingIndex: Int? = nil
     @State private var pendingDraggedCoord: CLLocationCoordinate2D? = nil
 
-    // 保存/ロード
+    // 保存/ロード/検索シート
     @State private var showingSave = false
     @State private var saveName = ""
     @State private var showLoadListSheet = false
+    @State private var showSearchSheet = false
 
     // 検索
     @State private var searchText = ""
@@ -61,54 +62,79 @@ struct RootMapScreen: View {
         NavigationStack {
             MapReader { proxy in
                 ZStack {
-                    // === Map（オーバーレイ含む）
+                    // === Map本体 ===================================================
                     Map(position: $camera) {
-                        mapLayers(proxy: proxy) // ← MapContentBuilder で分割
+                        mapLayers(proxy: proxy)   // MapContentBuilder で分割
                     }
+                    // 編集中でもパン/ズーム/回転できるように、Mapに同時ジェスチャを付与
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 0)
+                            .onEnded { value in
+                                guard editMode != .none, draggingIndex == nil else { return }
+                                // パン操作の終端と区別：移動量が小さい時だけ「タップ」と見なす
+                                let move = hypot(value.translation.width, value.translation.height)
+                                guard move < 5 else { return }
+                                if let coord = proxy.convert(value.location, from: .local) {
+                                    Task { await handleTapAdd(at: coord) }
+                                }
+                            }
+                    )
                     .onMapCameraChange(frequency: .continuous) { ctx in
                         searchRegion = ctx.region
                     }
-                    .mapControls { MapUserLocationButton(); MapCompass() }
+                    .mapControls {
+                        MapUserLocationButton()
+                        MapCompass()    // ← コンパス（タップで北固定）
+                    }
                     .ignoresSafeArea()
 
-                    // === 編集モード時：タップ追加（ドラッグでない時）
-                    if editMode != .none {
-                        Color.clear
-                            .contentShape(Rectangle())
-                            .ignoresSafeArea()
-                            .gesture(
-                                DragGesture(minimumDistance: 0)
-                                    .onEnded { value in
-                                        if draggingIndex != nil { return } // ドラッグだったら無視
-                                        if let coord = proxy.convert(value.location, from: .local) {
-                                            Task { await handleTapAdd(at: coord) }
-                                        }
-                                    }
-                            )
-                    }
-
-                    // === 上部：新規/編集 + クイック検索
+                    // === 上部：操作列（新規/編集/保存/ロード、ナビ開始・終了） ======
                     VStack(spacing: 8) {
                         HStack {
-                            Button("ルート新規作成") {
-                                editMode = .createNew
-                                editor.reset()
-                                activeNavRoute = nil
-                                nav.isNavigating = false
-                                store.selected = nil
-                            }
-                            .buttonStyle(.borderedProminent)
+                            // 左側：新規・編集
+                            HStack(spacing: 8) {
+                                Button("ルート新規作成") {
+                                    editMode = .createNew
+                                    editor.reset()
+                                    activeNavRoute = nil
+                                    nav.isNavigating = false
+                                    store.selected = nil
+                                }
+                                .buttonStyle(.borderedProminent)
 
-                            Button("ルート編集") {
-                                editMode = .editExisting
-                                editor.reset()
-                                activeNavRoute = nil
-                                nav.isNavigating = false
+                                Button("編集") {
+                                    editMode = .editExisting
+                                    // もし検索で経路が出ていたら、編集モードに初期値として流し込む
+                                    if let r = activeNavRoute,
+                                       editor.points.isEmpty {
+                                        if let start = location.lastCoordinate {
+                                            let end = coords(from: r.polyline).last ?? start   // ← ここで終点を取得
+                                            editor.points = [start, end]
+                                            editor.segments = [r.polyline]
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+
                             }
-                            .buttonStyle(.bordered)
 
                             Spacer()
 
+                            // 右側：ナビ開始/終了
+                            if activeNavRoute != nil && !nav.isNavigating {
+                                Button("開始") {
+                                    nav.isNavigating = true
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+                            if nav.isNavigating {
+                                Button("終了") {
+                                    nav.isNavigating = false
+                                }
+                                .buttonStyle(.bordered)
+                            }
+
+                            // 保存 / ロード
                             if !editor.segments.isEmpty {
                                 Button("保存") { showingSave = true }
                             }
@@ -116,27 +142,11 @@ struct RootMapScreen: View {
                         }
                         .padding(.horizontal, 12)
 
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 12) {
-                                ForEach([QuickPOIKind.gas, .ev, .toilet, .conv]) { k in
-                                    Button {
-                                        if poi.active == k { poi.clear() }
-                                        else { poi.run(k, around: searchRegion.center, span: searchRegion.span) }
-                                    } label: {
-                                        Label(k.rawValue, systemImage: k.icon)
-                                            .padding(.vertical, 6).padding(.horizontal, 10)
-                                            .background(.ultraThinMaterial, in: Capsule())
-                                    }
-                                }
-                            }
-                            .padding(.horizontal, 12)
-                        }
-
                         Spacer()
                     }
                     .padding(.top, 8)
 
-                    // === 左側：ナビ中の縦クイック
+                    // === 左サイド：ナビ中クイックボタン ============================
                     if nav.isNavigating {
                         VStack {
                             Spacer()
@@ -162,7 +172,7 @@ struct RootMapScreen: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
-                    // === 車線減少バナー
+                    // === 車線減少バナー ==========================================
                     VStack {
                         if let msg = nav.laneDropMessage {
                             LaneDropBanner(message: msg).padding(.top, 8)
@@ -171,7 +181,7 @@ struct RootMapScreen: View {
                     }
                     .animation(.easeInOut, value: nav.laneDropMessage)
 
-                    // === DriveHUD（ナビ中のみ表示）
+                    // === DriveHUD（ナビ中のみ） ==================================
                     if nav.isNavigating {
                         VStack { Spacer()
                             DriveHUD().environmentObject(nav)
@@ -181,56 +191,49 @@ struct RootMapScreen: View {
                         .ignoresSafeArea(edges: .bottom)
                     }
 
-                    // === POIリスト（下部）
-                    if let active = poi.active, !poi.results.isEmpty {
-                        BottomPOIList(
-                            kind: active,
-                            items: poi.results,
-                            distanceFrom: searchRegion.center,
-                            onSelect: { _ in /* TODO: 寄り道 */ },
-                            onClose: { poi.clear() }
-                        )
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                        .ignoresSafeArea(edges: .bottom)
-                    }
-                }
-            }
-            // Apple純正風 検索UI
-            .searchable(text: $searchText,
-                        placement: .navigationBarDrawer(displayMode: .always),
-                        prompt: Text("場所・住所を検索"))
-            .onChange(of: searchText) { new in
-                sugg.update(query: new, region: searchRegion)
-            }
-            .searchSuggestions {
-                // MKLocalSearchCompletion は Hashable でないため enumerated で安定ID付与
-                ForEach(Array(sugg.suggestions.enumerated()), id: \.offset) { _, s in
-                    Button {
-                        searchText = s.title
-                        searchPlaceAndZoom(name: s.title + " " + s.subtitle, region: searchRegion)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(s.title).font(.body)
-                            if !s.subtitle.isEmpty {
-                                Text(s.subtitle).font(.caption).foregroundStyle(.secondary)
+                    // === 下部：検索ボタン & POIリスト =============================
+                    VStack {
+                        Spacer()
+
+                        if let active = poi.active, !poi.results.isEmpty {
+                            BottomPOIList(
+                                kind: active,
+                                items: poi.results,
+                                distanceFrom: searchRegion.center,
+                                onSelect: { _ in /* TODO: 寄り道 */ },
+                                onClose: { poi.clear() }
+                            )
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                            .ignoresSafeArea(edges: .bottom)
+                        }
+
+                        // 下部・検索呼び出しボタン（純正のボトムシート風に）
+                        HStack {
+                            Spacer()
+                            Button {
+                                showSearchSheet = true
+                            } label: {
+                                Label("検索", systemImage: "magnifyingglass")
+                                    .font(.headline)
+                                    .padding(.horizontal, 14).padding(.vertical, 10)
+                                    .background(.ultraThinMaterial, in: Capsule())
                             }
+                            .padding(.bottom, 12)
+                            .padding(.trailing, 12)
                         }
                     }
                 }
             }
-            .onSubmit(of: .search) {
-                searchPlaceAndZoom(name: searchText, region: searchRegion)
-            }
         }
         // 位置権限＆更新開始
         .onAppear { location.start() }
-        // 現在地追従 + 交差点までの距離更新
+        // 現在地追従 + HUD更新
         .onReceive(location.$lastCoordinate) { coord in
             guard let c = coord else { return }
             if followUser {
                 camera = .camera(MapCamera(centerCoordinate: c, distance: 1200, heading: 0, pitch: 0))
             }
-            if let route = activeNavRoute {
+            if let route = activeNavRoute, nav.isNavigating {
                 updateHUD(route: route, user: c)
             }
         }
@@ -252,7 +255,25 @@ struct RootMapScreen: View {
         .sheet(isPresented: $showingRouteOption) {
             RouteOptionSheet(useHighway: $nav.useHighway)
         }
-        // デモ通知
+        // 検索ボトムシート
+        .sheet(isPresented: $showSearchSheet) {
+            SearchBottomSheet(
+                text: $searchText,
+                suggestions: sugg.suggestions,
+                onChange: { q in sugg.update(query: q, region: searchRegion) },
+                onSelect: { title, subtitle in
+                    searchText = title
+                    showSearchSheet = false
+                    searchPlaceAndShowRoute(name: title + " " + subtitle, region: searchRegion)
+                },
+                onSearch: { q in
+                    showSearchSheet = false
+                    searchPlaceAndShowRoute(name: q, region: searchRegion)
+                }
+            )
+            .presentationDetents([.medium, .large])
+        }
+        // デモ通知（任意）
         .onAppear {
             DispatchQueue.main.asyncAfter(deadline: .now()+3) {
                 if nav.isNavigating { nav.laneDropMessage = "1 km先で 3 → 2 車線" }
@@ -261,23 +282,26 @@ struct RootMapScreen: View {
         }
     }
 
-    // MARK: - Map Layers（※ View ではなく MapContent を返す）
+    // MARK: - Map Layers（MapContentBuilder）
     @MapContentBuilder
     private func mapLayers(proxy: MapProxy) -> some MapContent {
 
-        // 1) 編集中セグメント（道路スナップ済み）
+        // 現在地の青ピン（方向扇形付き）
+        UserAnnotation()
+
+        // 1) 編集中セグメント（青/5pt）
         ForEach(editor.segments.indices, id: \.self) { i in
             MapPolyline(coordinates: coords(from: editor.segments[i]))
                 .stroke(.blue, lineWidth: 5)
         }
 
-        // 2) ナビ経路（優先表示）
+        // 2) ナビ経路（緑/10pt）
         if let navRoute = activeNavRoute {
             MapPolyline(coordinates: coords(from: navRoute.polyline))
-                .stroke(.green, lineWidth: 6)
+                .stroke(.green, lineWidth: 10)
         }
 
-        // 3) 目的地検索の結果
+        // 3) 目的地検索結果
         ForEach(place.results) { item in
             Marker(item.name, coordinate: item.coordinate)
         }
@@ -287,16 +311,17 @@ struct RootMapScreen: View {
             Marker(item.name, coordinate: item.coordinate)
         }
 
-        // 5) 編集点（ドラッグ可）
+        // 5) 編集点（ドラッグ可）— グローバル座標→Mapへ変換でズレ解消
         ForEach(editor.points.indices, id: \.self) { idx in
-            Annotation("", coordinate: editor.points[idx]) {  // MapAnnotation は iOS17で非推奨
+            Annotation("", coordinate: editor.points[idx]) {
                 DraggableEditDot(
-                    onDragChanged: { loc in
-                        if draggingIndex == nil, let hit = hitTestPoint(loc, proxy: proxy) {
+                    onDragChangedGlobal: { globalPt in
+                        if draggingIndex == nil,
+                           let hit = hitTestPointGlobal(globalPt, proxy: proxy) {
                             draggingIndex = hit
                         }
                         if let i = draggingIndex,
-                           let c = proxy.convert(loc, from: .local) {
+                           let c = proxy.convert(globalPt, from: .global) {
                             pendingDraggedCoord = c
                             editor.points[i] = c
                         }
@@ -313,50 +338,43 @@ struct RootMapScreen: View {
         }
     }
 
-    // MARK: - 目的地検索→ズーム＆ナビ開始
-    private func searchPlaceAndZoom(name: String, region: MKCoordinateRegion) {
+    // MARK: - 検索→ルート表示（ナビは開始しない）
+    private func searchPlaceAndShowRoute(name: String, region: MKCoordinateRegion) {
         place.search(query: name, in: region)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            if let first = place.results.first {
-                camera = .camera(MapCamera(centerCoordinate: first.coordinate, distance: 1500, heading: 0, pitch: 0))
-                if let cur = location.lastCoordinate {
-                    Task { await startNavigation(from: cur, to: first.coordinate) }
+            guard let dest = place.results.first?.coordinate else { return }
+            if let cur = location.lastCoordinate {
+                Task {
+                    do {
+                        let route = try await engine.route(from: cur, to: dest, allowHighways: nav.useHighway)
+                        activeNavRoute = route
+                        nav.isNavigating = false
+                        // 編集初期化（編集したければ「編集」ボタンで）
+                        editor.reset()
+                        // カメラを目的地へ
+                        camera = .camera(MapCamera(centerCoordinate: dest, distance: 1500, heading: 0, pitch: 0))
+                    } catch { }
                 }
+            } else {
+                camera = .camera(MapCamera(centerCoordinate: dest, distance: 1500, heading: 0, pitch: 0))
             }
         }
     }
 
-    private func startNavigation(from: CLLocationCoordinate2D, to: CLLocationCoordinate2D) async {
-        do {
-            let route = try await engine.route(from: from, to: to, allowHighways: nav.useHighway)
-            activeNavRoute = route
-            nav.isNavigating = true
-            nav.remainingDistanceM = route.distance
-            nav.remainingTimeSec = route.expectedTravelTime
-            nav.nextDistanceM = route.steps.first?.distance ?? route.distance
-            nav.progress = 0
-        } catch {
-            // 無視（UI変更なし）
-        }
-    }
-
-    // MARK: - 編集：タップ追加とドラッグ再計算
+    // MARK: - 編集：タップ追加 & ドラッグ再計算
     private func handleTapAdd(at coord: CLLocationCoordinate2D) async {
-        switch editMode {
-        case .none: return
-        case .createNew, .editExisting:
-            if editor.points.isEmpty {
-                editor.points.append(coord)
-                return
-            }
-            guard let last = editor.points.last else { return }
-            do {
-                let route = try await engine.route(from: last, to: coord, allowHighways: nav.useHighway)
-                editor.points.append(coord)
-                editor.segments.append(route.polyline)
-            } catch {
-                editor.points.append(coord) // 失敗時は点のみ
-            }
+        guard editMode != .none else { return }
+        if editor.points.isEmpty {
+            editor.points.append(coord)
+            return
+        }
+        guard let last = editor.points.last else { return }
+        do {
+            let route = try await engine.route(from: last, to: coord, allowHighways: nav.useHighway)
+            editor.points.append(coord)
+            editor.segments.append(route.polyline)
+        } catch {
+            editor.points.append(coord)
         }
     }
 
@@ -382,7 +400,22 @@ struct RootMapScreen: View {
         }
     }
 
-    // 画面座標から「近い編集点」をヒットテスト
+    // 画面座標→近い編集点（グローバル座標版）
+    private func hitTestPointGlobal(_ global: CGPoint, proxy: MapProxy) -> Int? {
+        let threshold: CGFloat = 28
+        var bestIdx: Int? = nil
+        var bestDist = CGFloat.greatestFiniteMagnitude
+        for (i, c) in editor.points.enumerated() {
+            let p = proxy.convert(c, to: .global) ?? .zero
+            let d = hypot(p.x - global.x, p.y - global.y)
+            if d < threshold && d < bestDist {
+                bestDist = d; bestIdx = i
+            }
+        }
+        return bestIdx
+    }
+
+    // 従来のローカル座標版（タップ用に保持）
     private func hitTestPoint(_ loc: CGPoint, proxy: MapProxy) -> Int? {
         let threshold: CGFloat = 28
         var bestIdx: Int? = nil
@@ -405,12 +438,11 @@ struct RootMapScreen: View {
             let d = distanceToPolyline(from: user, polyline: step.polyline)
             if d < nearestDistance { nearestDistance = d; nearestStepIndex = i }
         }
-
         let remainInStep = remainingDistanceOnPolyline(from: user, polyline: route.steps[nearestStepIndex].polyline)
-
         nav.nextDistanceM = max(0, remainInStep)
+
         let passed = routeDistanceUptoStep(route, index: nearestStepIndex)
-                   + (route.steps[nearestStepIndex].distance - remainInStep)
+                 + (route.steps[nearestStepIndex].distance - remainInStep)
         nav.remainingDistanceM = max(0, route.distance - passed)
         nav.progress = max(0, min(1, passed / max(route.distance, 1)))
         nav.remainingTimeSec = max(0, route.expectedTravelTime * (nav.remainingDistanceM / max(route.distance, 1)))
@@ -471,9 +503,7 @@ struct RootMapScreen: View {
     private func distancePointToSegment(_ p: MKMapPoint, _ a: MKMapPoint, _ b: MKMapPoint) -> CLLocationDistance {
         return projectPointToSegment(p, a, b).1
     }
-    private func projectPointToSegment(_ p: MKMapPoint, _ a: MKMapPoint, _ b: MKMapPoint)
-        -> (MKMapPoint, CLLocationDistance)
-    {
+    private func projectPointToSegment(_ p: MKMapPoint, _ a: MKMapPoint, _ b: MKMapPoint) -> (MKMapPoint, CLLocationDistance) {
         let apx = p.x - a.x, apy = p.y - a.y
         let abx = b.x - a.x, aby = b.y - a.y
         let ab2 = abx*abx + aby*aby
@@ -485,20 +515,80 @@ struct RootMapScreen: View {
     private func showLoadList() { showLoadListSheet = true }
 }
 
-// ドラッグ用の小さな点 View
+// 下部・検索ボトムシート（純正風・安全版）
+private struct SearchBottomSheet: View {
+    @Binding var text: String
+    var suggestions: [MKLocalSearchCompletion]
+    var onChange: (String) -> Void
+    var onSelect: (String, String) -> Void
+    var onSearch: (String) -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Capsule()
+                .fill(.secondary.opacity(0.4))
+                .frame(width: 40, height: 5)
+                .padding(.top, 8)
+
+            HStack(spacing: 8) {
+                TextField("場所・住所を検索", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: text) { newValue in
+                        onChange(newValue)
+                    }
+
+                Button(action: { onSearch(text) }) {
+                    Image(systemName: "magnifyingglass.circle.fill")
+                        .font(.title2)
+                }
+            }
+            .padding(.horizontal, 12)
+
+            List {
+                ForEach(Array(suggestions.enumerated()), id: \.offset) { _, s in
+                    Button(action: { onSelect(s.title, s.subtitle) }) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(s.title)
+                            if !s.subtitle.isEmpty {
+                                Text(s.subtitle)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .listStyle(.plain)
+        }
+        .presentationDragIndicator(.visible)
+    }
+}
+
+
+// ドラッグ用の点（グローバル座標で報告）
 private struct DraggableEditDot: View {
-    let onDragChanged: (CGPoint) -> Void
+    let onDragChangedGlobal: (CGPoint) -> Void
     let onDragEnded: () -> Void
 
     var body: some View {
-        Circle()
-            .fill(Color.orange)
-            .frame(width: 16, height: 16)
-            .overlay(Circle().stroke(.white, lineWidth: 2))
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { onDragChanged($0.location) }
-                    .onEnded { _ in onDragEnded() }
-            )
+        GeometryReader { geo in
+            Circle()
+                .fill(Color.orange)
+                .frame(width: 16, height: 16)
+                .overlay(Circle().stroke(.white, lineWidth: 2))
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { v in
+                            // 自Viewのローカル座標 → グローバル座標に変換して渡す
+                            let origin = geo.frame(in: .global).origin
+                            let g = CGPoint(x: origin.x + v.location.x, y: origin.y + v.location.y)
+                            onDragChangedGlobal(g)
+                        }
+                        .onEnded { _ in onDragEnded() }
+                )
+        }
+        // GeometryReader の外形サイズ
+        .frame(width: 24, height: 24)
     }
 }
