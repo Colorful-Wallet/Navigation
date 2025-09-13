@@ -44,7 +44,7 @@ struct RootMapScreen: View {
     @State private var searchText = ""
     @State private var showingRouteOption = false
 
-    // 現在地
+    // 現在地追従
     @State private var followUser = true
 
     // ナビ用
@@ -63,7 +63,7 @@ struct RootMapScreen: View {
         NavigationStack {
             MapReader { proxy in
                 ZStack {
-                    // === Map本体 ===================================================
+                    // === Map =====================================================
                     Map(position: $camera) {
                         mapLayers(proxy: proxy)
                     }
@@ -74,11 +74,11 @@ struct RootMapScreen: View {
                                 guard editMode != .none, draggingIndex == nil else { return }
                                 let move = hypot(value.translation.width, value.translation.height)
                                 guard move < 5 else { return } // パン判定
-                                // 1) ルート上タップなら挿入を試みる
+                                // 1) 既存ルート線上タップなら挿入
                                 if tryInsertPointOnRoute(from: value.location, proxy: proxy) {
                                     return
                                 }
-                                // 2) それ以外は通常の追加
+                                // 2) それ以外は通常追加
                                 if let coord = proxy.convert(value.location, from: .local) {
                                     Task { await handleTapAdd(at: coord) }
                                 }
@@ -87,35 +87,16 @@ struct RootMapScreen: View {
                     .onMapCameraChange(frequency: .continuous) { ctx in
                         searchRegion = ctx.region
                     }
-                    .mapControls {
-                        MapUserLocationButton()
-                        MapCompass() // コンパス（北向き復帰）
-                    }
+                    .mapControls { MapUserLocationButton(); MapCompass() }
                     .ignoresSafeArea()
 
-                    // === 上部：操作列 =================================================
-                    VStack(spacing: 0) {
-                        // 編集モード中は黒いバー＋キャンセル
-                        if editMode != .none {
-                            HStack {
-                                Label(editMode == .createNew ? "ルート作成中" : "ルート編集中",
-                                      systemImage: "pencil.and.outline")
-                                    .font(.headline)
-                                Spacer()
-                                Button("キャンセル") { cancelEditing() }
-                                    .buttonStyle(.bordered)
-                                    .tint(.red)
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .frame(maxWidth: .infinity)
-                            .background(Color.black.opacity(0.88))
-                            .foregroundStyle(.white)
-                        } else {
-                            // 通常ツールバー
+                    // === 通常ツールバー行（編集中は非表示） =======================
+                    if editMode == .none {
+                        VStack {
                             HStack {
                                 Button("ルート新規作成") {
                                     editMode = .createNew
+                                    followUser = false                    // 追従停止
                                     editor.reset()
                                     activeNavRoute = nil
                                     nav.isNavigating = false
@@ -125,7 +106,7 @@ struct RootMapScreen: View {
 
                                 Button("編集") {
                                     editMode = .editExisting
-                                    // ルート表示済みなら初期点として流し込む
+                                    followUser = false                    // 追従停止
                                     if let r = activeNavRoute,
                                        editor.points.isEmpty,
                                        let start = location.lastCoordinate {
@@ -139,12 +120,17 @@ struct RootMapScreen: View {
                                 Spacer()
 
                                 if activeNavRoute != nil && !nav.isNavigating {
-                                    Button("開始") { nav.isNavigating = true }
-                                        .buttonStyle(.borderedProminent)
+                                    Button("開始") {
+                                        nav.isNavigating = true
+                                        followUser = true                  // ナビでは追従ON
+                                    }
+                                    .buttonStyle(.borderedProminent)
                                 }
                                 if nav.isNavigating {
-                                    Button("終了") { nav.isNavigating = false }
-                                        .buttonStyle(.bordered)
+                                    Button("終了") {
+                                        nav.isNavigating = false
+                                    }
+                                    .buttonStyle(.bordered)
                                 }
 
                                 if !editor.segments.isEmpty {
@@ -153,14 +139,13 @@ struct RootMapScreen: View {
                                 Button("ロード") { showLoadList() }
                             }
                             .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
+                            .padding(.top, 8)
+
+                            Spacer()
                         }
-
-                        Spacer()
                     }
-                    .padding(.top, 8)
 
-                    // === 左サイド：ナビ中クイックボタン ============================
+                    // === 左サイド：ナビ中クイック ================================
                     if nav.isNavigating {
                         VStack {
                             Spacer()
@@ -237,6 +222,22 @@ struct RootMapScreen: View {
                     }
                 }
             }
+            // ==== ナビゲーションバー（編集中だけ黒＋キャンセル） ===================
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if editMode != .none {
+                    ToolbarItem(placement: .principal) {
+                        Text(editMode == .createNew ? "ルート作成中" : "ルート編集中")
+                            .font(.headline)
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("キャンセル") { cancelEditing() }
+                    }
+                }
+            }
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarBackground(editMode != .none ? .black : Color(.systemBackground), for: .navigationBar)
+            .toolbarColorScheme(editMode != .none ? .dark : .light, for: .navigationBar)
         }
         // 現在地追従 + HUD更新
         .onAppear { location.start() }
@@ -290,33 +291,31 @@ struct RootMapScreen: View {
     // MARK: - Map Layers（MapContentBuilder）
     @MapContentBuilder
     private func mapLayers(proxy: MapProxy) -> some MapContent {
-
-        // 現在地の青ピン（方向扇形付き）
+        // 現在地
         UserAnnotation()
 
-        // 1) 編集中セグメント（青/5pt）
+        // 編集中セグメント（青/5pt）
         ForEach(editor.segments.indices, id: \.self) { i in
             MapPolyline(coordinates: coords(from: editor.segments[i]))
                 .stroke(.blue, lineWidth: 5)
         }
 
-        // 2) ナビ経路（緑/10pt）
+        // ナビ経路（緑/10pt）
         if let navRoute = activeNavRoute {
             MapPolyline(coordinates: coords(from: navRoute.polyline))
                 .stroke(.green, lineWidth: 10)
         }
 
-        // 3) 目的地検索結果
+        // 検索結果
         ForEach(place.results) { item in
             Marker(item.name, coordinate: item.coordinate)
         }
-
-        // 4) POI ピン
+        // POI
         ForEach(poi.results) { item in
             Marker(item.name, coordinate: item.coordinate)
         }
 
-        // 5) 編集点（ドラッグ可・番号表示）— 編集中のみ出す
+        // 編集点（番号入り, ドラッグ可）— 編集中のみ
         if editMode != .none {
             ForEach(editor.points.indices, id: \.self) { idx in
                 Annotation("", coordinate: editor.points[idx]) {
@@ -357,7 +356,7 @@ struct RootMapScreen: View {
                         let route = try await engine.route(from: cur, to: dest, allowHighways: nav.useHighway)
                         activeNavRoute = route
                         nav.isNavigating = false
-                        editor.reset() // 編集は別途「編集」ボタンで
+                        editor.reset() // 編集は「編集」ボタンで
                         camera = .camera(MapCamera(centerCoordinate: dest, distance: 1500, heading: 0, pitch: 0))
                     } catch { }
                 }
@@ -405,7 +404,7 @@ struct RootMapScreen: View {
         }
     }
 
-    // === ルート上タップ → その線上にポイントを挿入 ===========================
+    // === 線上タップで挿入：前後のセグメントを「置換＋挿入」で必ず繋ぐ ==========
     private func tryInsertPointOnRoute(from tapLocal: CGPoint, proxy: MapProxy) -> Bool {
         guard editMode != .none else { return false }
         guard !editor.segments.isEmpty else { return false }
@@ -425,8 +424,29 @@ struct RootMapScreen: View {
 
         let insertIndex = min(b.segIndex + 1, editor.points.count)
         editor.points.insert(b.coord, at: insertIndex)
-        Task { await recalcAround(index: insertIndex, newCoord: b.coord) }
+        // ここが肝：前後2区間を再計算し、segments を置換＋挿入で更新
+        Task { await rebuildSegmentsAroundInsertion(insertedAt: insertIndex) }
         return true
+    }
+
+    private func rebuildSegmentsAroundInsertion(insertedAt i: Int) async {
+        // i は points[i-1]—points[i] の間に挿入された新しい点のインデックス
+        // 1) 前区間： [i-1] → [i] を計算し、segments[i-1] を置換
+        if i - 1 >= 0 && i < editor.points.count {
+            let a = editor.points[i - 1], b = editor.points[i]
+            if let r = try? await engine.route(from: a, to: b, allowHighways: nav.useHighway) {
+                if i - 1 < editor.segments.count { editor.segments[i - 1] = r.polyline }
+                else { editor.segments.append(r.polyline) }
+            }
+        }
+        // 2) 後区間： [i] → [i+1] を計算し、segments[i] に「挿入」
+        if i < editor.points.count - 1 {
+            let a = editor.points[i], b = editor.points[i + 1]
+            if let r = try? await engine.route(from: a, to: b, allowHighways: nav.useHighway) {
+                if i < editor.segments.count { editor.segments.insert(r.polyline, at: i) }
+                else { editor.segments.append(r.polyline) }
+            }
+        }
     }
 
     private func nearestOnPolyline(_ poly: MKPolyline,
@@ -552,11 +572,12 @@ struct RootMapScreen: View {
     private func cancelEditing() {
         editor.reset()
         editMode = .none
+        followUser = true // 編集終了後は追従を戻す（必要に応じて変更）
     }
     private func showLoadList() { showLoadListSheet = true }
 }
 
-// 下部・検索ボトムシート（安全版）
+// ====== 下部・検索ボトムシート（安全版） ======================================
 private struct SearchBottomSheet: View {
     @Binding var text: String
     var suggestions: [MKLocalSearchCompletion]
@@ -575,8 +596,7 @@ private struct SearchBottomSheet: View {
                     .textFieldStyle(.roundedBorder)
                     .onChange(of: text) { onChange($0) }
                 Button(action: { onSearch(text) }) {
-                    Image(systemName: "magnifyingglass.circle.fill")
-                        .font(.title2)
+                    Image(systemName: "magnifyingglass.circle.fill").font(.title2)
                 }
             }
             .padding(.horizontal, 12)
@@ -599,7 +619,7 @@ private struct SearchBottomSheet: View {
     }
 }
 
-// ドラッグ用の点（番号入り・グローバル座標で通知）
+// ====== ドラッグ用の点（番号入り・グローバル座標で通知） =====================
 private struct DraggableEditDot: View {
     let text: String
     let onDragChangedGlobal: (CGPoint) -> Void
@@ -608,11 +628,8 @@ private struct DraggableEditDot: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                Circle()
-                    .fill(Color.orange)
-                Text(text)
-                    .font(.caption2).bold()
-                    .foregroundStyle(.white)
+                Circle().fill(Color.orange)
+                Text(text).font(.caption2).bold().foregroundStyle(.white)
             }
             .contentShape(Rectangle())
             .gesture(
@@ -625,6 +642,6 @@ private struct DraggableEditDot: View {
                     .onEnded { _ in onDragEnded() }
             )
         }
-        .frame(width: 24, height: 24) // GeometryReader の外形サイズ
+        .frame(width: 24, height: 24)
     }
 }
