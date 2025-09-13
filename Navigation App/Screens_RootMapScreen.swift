@@ -29,6 +29,7 @@ struct RootMapScreen: View {
     @State private var searchRegion: MKCoordinateRegion
 
     // 編集
+    enum EditModeKind { case none, createNew, editExisting }
     @State private var editMode: EditModeKind = .none
     @State private var draggingIndex: Int? = nil
     @State private var pendingDraggedCoord: CLLocationCoordinate2D? = nil
@@ -64,16 +65,20 @@ struct RootMapScreen: View {
                 ZStack {
                     // === Map本体 ===================================================
                     Map(position: $camera) {
-                        mapLayers(proxy: proxy)   // MapContentBuilder で分割
+                        mapLayers(proxy: proxy)
                     }
-                    // 編集中でもパン/ズーム/回転できるように、Mapに同時ジェスチャを付与
+                    // 編集中でもパン/ズーム/回転OK。移動量が小さいときだけ「タップ扱い」。
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 0)
                             .onEnded { value in
                                 guard editMode != .none, draggingIndex == nil else { return }
-                                // パン操作の終端と区別：移動量が小さい時だけ「タップ」と見なす
                                 let move = hypot(value.translation.width, value.translation.height)
-                                guard move < 5 else { return }
+                                guard move < 5 else { return } // パン判定
+                                // 1) ルート上タップなら挿入を試みる
+                                if tryInsertPointOnRoute(from: value.location, proxy: proxy) {
+                                    return
+                                }
+                                // 2) それ以外は通常の追加
                                 if let coord = proxy.convert(value.location, from: .local) {
                                     Task { await handleTapAdd(at: coord) }
                                 }
@@ -84,15 +89,31 @@ struct RootMapScreen: View {
                     }
                     .mapControls {
                         MapUserLocationButton()
-                        MapCompass()    // ← コンパス（タップで北固定）
+                        MapCompass() // コンパス（北向き復帰）
                     }
                     .ignoresSafeArea()
 
-                    // === 上部：操作列（新規/編集/保存/ロード、ナビ開始・終了） ======
-                    VStack(spacing: 8) {
-                        HStack {
-                            // 左側：新規・編集
-                            HStack(spacing: 8) {
+                    // === 上部：操作列 =================================================
+                    VStack(spacing: 0) {
+                        // 編集モード中は黒いバー＋キャンセル
+                        if editMode != .none {
+                            HStack {
+                                Label(editMode == .createNew ? "ルート作成中" : "ルート編集中",
+                                      systemImage: "pencil.and.outline")
+                                    .font(.headline)
+                                Spacer()
+                                Button("キャンセル") { cancelEditing() }
+                                    .buttonStyle(.bordered)
+                                    .tint(.red)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity)
+                            .background(Color.black.opacity(0.88))
+                            .foregroundStyle(.white)
+                        } else {
+                            // 通常ツールバー
+                            HStack {
                                 Button("ルート新規作成") {
                                     editMode = .createNew
                                     editor.reset()
@@ -104,43 +125,36 @@ struct RootMapScreen: View {
 
                                 Button("編集") {
                                     editMode = .editExisting
-                                    // もし検索で経路が出ていたら、編集モードに初期値として流し込む
+                                    // ルート表示済みなら初期点として流し込む
                                     if let r = activeNavRoute,
-                                       editor.points.isEmpty {
-                                        if let start = location.lastCoordinate {
-                                            let end = coords(from: r.polyline).last ?? start   // ← ここで終点を取得
-                                            editor.points = [start, end]
-                                            editor.segments = [r.polyline]
-                                        }
+                                       editor.points.isEmpty,
+                                       let start = location.lastCoordinate {
+                                        let end = coords(from: r.polyline).last ?? start
+                                        editor.points = [start, end]
+                                        editor.segments = [r.polyline]
                                     }
                                 }
                                 .buttonStyle(.bordered)
 
-                            }
+                                Spacer()
 
-                            Spacer()
-
-                            // 右側：ナビ開始/終了
-                            if activeNavRoute != nil && !nav.isNavigating {
-                                Button("開始") {
-                                    nav.isNavigating = true
+                                if activeNavRoute != nil && !nav.isNavigating {
+                                    Button("開始") { nav.isNavigating = true }
+                                        .buttonStyle(.borderedProminent)
                                 }
-                                .buttonStyle(.borderedProminent)
-                            }
-                            if nav.isNavigating {
-                                Button("終了") {
-                                    nav.isNavigating = false
+                                if nav.isNavigating {
+                                    Button("終了") { nav.isNavigating = false }
+                                        .buttonStyle(.bordered)
                                 }
-                                .buttonStyle(.bordered)
-                            }
 
-                            // 保存 / ロード
-                            if !editor.segments.isEmpty {
-                                Button("保存") { showingSave = true }
+                                if !editor.segments.isEmpty {
+                                    Button("保存") { showingSave = true }
+                                }
+                                Button("ロード") { showLoadList() }
                             }
-                            Button("ロード") { showLoadList() }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
                         }
-                        .padding(.horizontal, 12)
 
                         Spacer()
                     }
@@ -200,14 +214,13 @@ struct RootMapScreen: View {
                                 kind: active,
                                 items: poi.results,
                                 distanceFrom: searchRegion.center,
-                                onSelect: { _ in /* TODO: 寄り道 */ },
+                                onSelect: { _ in /* TODO */ },
                                 onClose: { poi.clear() }
                             )
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                             .ignoresSafeArea(edges: .bottom)
                         }
 
-                        // 下部・検索呼び出しボタン（純正のボトムシート風に）
                         HStack {
                             Spacer()
                             Button {
@@ -225,9 +238,8 @@ struct RootMapScreen: View {
                 }
             }
         }
-        // 位置権限＆更新開始
-        .onAppear { location.start() }
         // 現在地追従 + HUD更新
+        .onAppear { location.start() }
         .onReceive(location.$lastCoordinate) { coord in
             guard let c = coord else { return }
             if followUser {
@@ -273,13 +285,6 @@ struct RootMapScreen: View {
             )
             .presentationDetents([.medium, .large])
         }
-        // デモ通知（任意）
-        .onAppear {
-            DispatchQueue.main.asyncAfter(deadline: .now()+3) {
-                if nav.isNavigating { nav.laneDropMessage = "1 km先で 3 → 2 車線" }
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now()+10) { nav.laneDropMessage = nil }
-        }
     }
 
     // MARK: - Map Layers（MapContentBuilder）
@@ -311,29 +316,32 @@ struct RootMapScreen: View {
             Marker(item.name, coordinate: item.coordinate)
         }
 
-        // 5) 編集点（ドラッグ可）— グローバル座標→Mapへ変換でズレ解消
-        ForEach(editor.points.indices, id: \.self) { idx in
-            Annotation("", coordinate: editor.points[idx]) {
-                DraggableEditDot(
-                    onDragChangedGlobal: { globalPt in
-                        if draggingIndex == nil,
-                           let hit = hitTestPointGlobal(globalPt, proxy: proxy) {
-                            draggingIndex = hit
+        // 5) 編集点（ドラッグ可・番号表示）— 編集中のみ出す
+        if editMode != .none {
+            ForEach(editor.points.indices, id: \.self) { idx in
+                Annotation("", coordinate: editor.points[idx]) {
+                    DraggableEditDot(
+                        text: String(idx + 1),
+                        onDragChangedGlobal: { globalPt in
+                            if draggingIndex == nil,
+                               let hit = hitTestPointGlobal(globalPt, proxy: proxy) {
+                                draggingIndex = hit
+                            }
+                            if let i = draggingIndex,
+                               let c = proxy.convert(globalPt, from: .global) {
+                                pendingDraggedCoord = c
+                                editor.points[i] = c
+                            }
+                        },
+                        onDragEnded: {
+                            if let i = draggingIndex, let new = pendingDraggedCoord {
+                                Task { await recalcAround(index: i, newCoord: new) }
+                            }
+                            draggingIndex = nil
+                            pendingDraggedCoord = nil
                         }
-                        if let i = draggingIndex,
-                           let c = proxy.convert(globalPt, from: .global) {
-                            pendingDraggedCoord = c
-                            editor.points[i] = c
-                        }
-                    },
-                    onDragEnded: {
-                        if let i = draggingIndex, let new = pendingDraggedCoord {
-                            Task { await recalcAround(index: i, newCoord: new) }
-                        }
-                        draggingIndex = nil
-                        pendingDraggedCoord = nil
-                    }
-                )
+                    )
+                }
             }
         }
     }
@@ -349,9 +357,7 @@ struct RootMapScreen: View {
                         let route = try await engine.route(from: cur, to: dest, allowHighways: nav.useHighway)
                         activeNavRoute = route
                         nav.isNavigating = false
-                        // 編集初期化（編集したければ「編集」ボタンで）
-                        editor.reset()
-                        // カメラを目的地へ
+                        editor.reset() // 編集は別途「編集」ボタンで
                         camera = .camera(MapCamera(centerCoordinate: dest, distance: 1500, heading: 0, pitch: 0))
                     } catch { }
                 }
@@ -381,7 +387,6 @@ struct RootMapScreen: View {
     private func recalcAround(index: Int, newCoord: CLLocationCoordinate2D) async {
         guard index < editor.points.count else { return }
         editor.points[index] = newCoord
-
         // 前区間
         if index - 1 >= 0 {
             let a = editor.points[index - 1]
@@ -400,6 +405,58 @@ struct RootMapScreen: View {
         }
     }
 
+    // === ルート上タップ → その線上にポイントを挿入 ===========================
+    private func tryInsertPointOnRoute(from tapLocal: CGPoint, proxy: MapProxy) -> Bool {
+        guard editMode != .none else { return false }
+        guard !editor.segments.isEmpty else { return false }
+
+        let threshold: CGFloat = 24 // px
+        var best: (segIndex: Int, coord: CLLocationCoordinate2D, screenDist: CGFloat)? = nil
+
+        for (i, pl) in editor.segments.enumerated() {
+            if let hit = nearestOnPolyline(pl, toLocalPoint: tapLocal, proxy: proxy) {
+                if best == nil || hit.screenDist < best!.screenDist {
+                    best = (i, hit.coord, hit.screenDist)
+                }
+            }
+        }
+
+        guard let b = best, b.screenDist <= threshold else { return false }
+
+        let insertIndex = min(b.segIndex + 1, editor.points.count)
+        editor.points.insert(b.coord, at: insertIndex)
+        Task { await recalcAround(index: insertIndex, newCoord: b.coord) }
+        return true
+    }
+
+    private func nearestOnPolyline(_ poly: MKPolyline,
+                                   toLocalPoint tapLocal: CGPoint,
+                                   proxy: MapProxy) -> (coord: CLLocationCoordinate2D, screenDist: CGFloat, segIndex: Int)?
+    {
+        guard let tapCoord = proxy.convert(tapLocal, from: .local) else { return nil }
+        let P = MKMapPoint(tapCoord)
+        let cs = coords(from: poly)
+        guard cs.count >= 2 else { return nil }
+        let pts = cs.map { MKMapPoint($0) }
+
+        var bestDist = CGFloat.greatestFiniteMagnitude
+        var bestCoord = cs[0]
+        var bestSeg = 0
+
+        for j in 0..<(pts.count - 1) {
+            let (proj, _) = projectPointToSegment(P, pts[j], pts[j+1])
+            let projCoord = proj.coordinate
+            let screenPt = proxy.convert(projCoord, to: .local) ?? .zero
+            let d = hypot(screenPt.x - tapLocal.x, screenPt.y - tapLocal.y)
+            if d < bestDist {
+                bestDist = d
+                bestCoord = projCoord
+                bestSeg = j
+            }
+        }
+        return (bestCoord, bestDist, bestSeg)
+    }
+
     // 画面座標→近い編集点（グローバル座標版）
     private func hitTestPointGlobal(_ global: CGPoint, proxy: MapProxy) -> Int? {
         let threshold: CGFloat = 28
@@ -408,21 +465,6 @@ struct RootMapScreen: View {
         for (i, c) in editor.points.enumerated() {
             let p = proxy.convert(c, to: .global) ?? .zero
             let d = hypot(p.x - global.x, p.y - global.y)
-            if d < threshold && d < bestDist {
-                bestDist = d; bestIdx = i
-            }
-        }
-        return bestIdx
-    }
-
-    // 従来のローカル座標版（タップ用に保持）
-    private func hitTestPoint(_ loc: CGPoint, proxy: MapProxy) -> Int? {
-        let threshold: CGFloat = 28
-        var bestIdx: Int? = nil
-        var bestDist = CGFloat.greatestFiniteMagnitude
-        for (i, c) in editor.points.enumerated() {
-            let p = proxy.convert(c, to: .local) ?? .zero
-            let d = hypot(p.x - loc.x, p.y - loc.y)
             if d < threshold && d < bestDist {
                 bestDist = d; bestIdx = i
             }
@@ -454,7 +496,6 @@ struct RootMapScreen: View {
         pl.getCoordinates(&arr, range: NSRange(location: 0, length: pl.pointCount))
         return arr
     }
-
     private func distanceToPolyline(from point: CLLocationCoordinate2D, polyline: MKPolyline) -> CLLocationDistance {
         let pts = coords(from: polyline).map { MKMapPoint($0) }
         let p = MKMapPoint(point)
@@ -465,7 +506,6 @@ struct RootMapScreen: View {
         }
         return best
     }
-
     private func remainingDistanceOnPolyline(from point: CLLocationCoordinate2D, polyline: MKPolyline) -> CLLocationDistance {
         let cs = coords(from: polyline)
         guard cs.count >= 2 else { return 0 }
@@ -493,13 +533,10 @@ struct RootMapScreen: View {
         }
         return remain
     }
-
     private func routeDistanceUptoStep(_ route: MKRoute, index: Int) -> CLLocationDistance {
         guard index > 0 else { return 0 }
         return route.steps.prefix(index).reduce(0) { $0 + $1.distance }
     }
-
-    // 幾何ユーティリティ
     private func distancePointToSegment(_ p: MKMapPoint, _ a: MKMapPoint, _ b: MKMapPoint) -> CLLocationDistance {
         return projectPointToSegment(p, a, b).1
     }
@@ -512,10 +549,14 @@ struct RootMapScreen: View {
         return (proj, proj.distance(to: p))
     }
 
+    private func cancelEditing() {
+        editor.reset()
+        editMode = .none
+    }
     private func showLoadList() { showLoadListSheet = true }
 }
 
-// 下部・検索ボトムシート（純正風・安全版）
+// 下部・検索ボトムシート（安全版）
 private struct SearchBottomSheet: View {
     @Binding var text: String
     var suggestions: [MKLocalSearchCompletion]
@@ -525,18 +566,14 @@ private struct SearchBottomSheet: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            Capsule()
-                .fill(.secondary.opacity(0.4))
+            Capsule().fill(.secondary.opacity(0.4))
                 .frame(width: 40, height: 5)
                 .padding(.top, 8)
 
             HStack(spacing: 8) {
                 TextField("場所・住所を検索", text: $text)
                     .textFieldStyle(.roundedBorder)
-                    .onChange(of: text) { newValue in
-                        onChange(newValue)
-                    }
-
+                    .onChange(of: text) { onChange($0) }
                 Button(action: { onSearch(text) }) {
                     Image(systemName: "magnifyingglass.circle.fill")
                         .font(.title2)
@@ -550,9 +587,7 @@ private struct SearchBottomSheet: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(s.title)
                             if !s.subtitle.isEmpty {
-                                Text(s.subtitle)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                Text(s.subtitle).font(.caption).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -564,31 +599,32 @@ private struct SearchBottomSheet: View {
     }
 }
 
-
-// ドラッグ用の点（グローバル座標で報告）
+// ドラッグ用の点（番号入り・グローバル座標で通知）
 private struct DraggableEditDot: View {
+    let text: String
     let onDragChangedGlobal: (CGPoint) -> Void
     let onDragEnded: () -> Void
 
     var body: some View {
         GeometryReader { geo in
-            Circle()
-                .fill(Color.orange)
-                .frame(width: 16, height: 16)
-                .overlay(Circle().stroke(.white, lineWidth: 2))
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { v in
-                            // 自Viewのローカル座標 → グローバル座標に変換して渡す
-                            let origin = geo.frame(in: .global).origin
-                            let g = CGPoint(x: origin.x + v.location.x, y: origin.y + v.location.y)
-                            onDragChangedGlobal(g)
-                        }
-                        .onEnded { _ in onDragEnded() }
-                )
+            ZStack {
+                Circle()
+                    .fill(Color.orange)
+                Text(text)
+                    .font(.caption2).bold()
+                    .foregroundStyle(.white)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        let origin = geo.frame(in: .global).origin
+                        let g = CGPoint(x: origin.x + v.location.x, y: origin.y + v.location.y)
+                        onDragChangedGlobal(g)
+                    }
+                    .onEnded { _ in onDragEnded() }
+            )
         }
-        // GeometryReader の外形サイズ
-        .frame(width: 24, height: 24)
+        .frame(width: 24, height: 24) // GeometryReader の外形サイズ
     }
 }
